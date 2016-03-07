@@ -1,8 +1,10 @@
 import bpy
 import bpy.props
+import bpy_extras
 import mathutils
 
-from mathutils import Vector
+from mathutils import Vector, Matrix
+from bpy_extras.io_utils import ImportHelper, orientation_helper_factory, axis_conversion
 from bpy.props import *
 
 import bmesh
@@ -227,6 +229,8 @@ class RipFile(object):
 
 class RipConversion(object):
     def __init__(self):
+        self.matrix = Matrix().to_3x3()
+        self.flip_winding = False
         self.use_normals = True
         self.use_weights = True
         self.normal_max_int = 255
@@ -328,17 +332,30 @@ class RipConversion(object):
 
             return bpy.data.textures.new(name, type='IMAGE')
 
+    def apply_matrix(self, vec):
+        return self.matrix * Vector(vec)
+
+    def apply_matrix_list(self, lst):
+        return list(map(self.apply_matrix, lst))
+
     def convert_object(self, rip, scene, obj_name):
         pos_attrs = rip.find_attrs('POSITION')
         if len(pos_attrs) == 0:
             pos_attrs = rip.attributes[0:1]
 
+        vert_pos = self.apply_matrix_list(pos_attrs[0].as_floats(3))
+
+        # Rewind triangles when necessary
+        faces = rip.faces
+        if (self.matrix.determinant() < 0) != self.flip_winding:
+            faces = list(map(lambda f: (f[1],f[0],f[2]), faces))
+
         # Create mesh
         mesh = bpy.data.meshes.new(obj_name)
-        mesh.from_pydata(pos_attrs[0].as_floats(3), [], rip.faces)
+        mesh.from_pydata(vert_pos, [], faces)
 
         # Assign normals
-        mesh.polygons.foreach_set("use_smooth", [True] * len(rip.faces))
+        mesh.polygons.foreach_set("use_smooth", [True] * len(faces))
 
         if self.use_normals:
             normals = self.get_normals(rip)
@@ -346,7 +363,7 @@ class RipConversion(object):
                 mesh.use_auto_smooth = True
                 mesh.show_normal_vertex = True
                 mesh.show_normal_loop = True
-                mesh.normals_split_custom_set_from_vertices(normals)
+                mesh.normals_split_custom_set_from_vertices(self.apply_matrix_list(normals))
 
         mesh.update()
 
@@ -441,24 +458,34 @@ class RipConversion(object):
 
         return nobj
 
-class RipImporter(bpy.types.Operator):
+IORIPOrientationHelper = orientation_helper_factory("IORIPOrientationHelper", axis_forward='-Z', axis_up='Y')
+
+class RipImporter(bpy.types.Operator, ImportHelper, IORIPOrientationHelper):
     """Load Ninja Ripper mesh data"""
     bl_idname = "import_mesh.rip"
     bl_label = "Import RIP"
-    bl_options = {'UNDO'}
+    bl_options = {'PRESET', 'UNDO'}
 
     filename_ext = ".rip"
     filter_glob = StringProperty(default="*.rip", options={'HIDDEN'})
-    filepath = StringProperty(subtype='FILE_PATH')
     files = CollectionProperty(name="File Path", type=bpy.types.OperatorFileListElement)
+
+    flip_x_axis = BoolProperty(
+        default=False, name="Invert X axis",
+        description="Flip the X axis values of the model"
+    )
+    flip_winding = BoolProperty(
+        default=False, name="Flip winding",
+        description="Invert triangle winding (NOTE: Invert X Axis is taken into account!)"
+    )
 
     use_normals = BoolProperty(
         default=True, name="Import custom normals",
         description="Import vertex normal data as custom normals"
     )
     normal_int = IntProperty(
-        default = 255, name="Max int normal",
-        description="Divide by this value if the normal data type is not float"
+        default = 255, name="Int Normal divisor",
+        description="Divide by this value if the normal data type is integer"
     )
     normal_mul = FloatVectorProperty(
         size=3,default=(1.0,1.0,1.0),step=1,
@@ -472,8 +499,8 @@ class RipImporter(bpy.types.Operator):
     )
 
     uv_int = IntProperty(
-        default = 255, name="Max int UV",
-        description="Divide by this value if the UV data type is not float"
+        default = 255, name="Int UV divisor",
+        description="Divide by this value if the UV data type is integer"
     )
     uv_mul = FloatVectorProperty(
         size=2,default=(1.0,1.0),step=1,
@@ -508,6 +535,13 @@ class RipImporter(bpy.types.Operator):
     def draw(self, context):
         self.layout.operator('file.select_all_toggle')
 
+        rot = self.layout.box()
+        rot.prop(self, "axis_forward")
+        rot.prop(self, "axis_up")
+        row = rot.row()
+        row.prop(self, "flip_x_axis")
+        row.prop(self, "flip_winding")
+
         misc = self.layout.box()
         misc.prop(self, "use_weights")
         misc.prop(self, "use_shaders")
@@ -538,7 +572,13 @@ class RipImporter(bpy.types.Operator):
             return (self.uv_mul[i], self.uv_add[i])
 
     def execute(self, context):
+        matrix = axis_conversion(from_forward=self.axis_forward, from_up=self.axis_up)
+        if self.flip_x_axis:
+            matrix = Matrix.Scale(-1, 3, (1.0, 0.0, 0.0)) * matrix
+
         conv = RipConversion()
+        conv.matrix = matrix
+        conv.flip_winding = self.flip_winding
         conv.use_normals = self.use_normals
         conv.use_weights = self.use_weights
         conv.normal_max_int = self.normal_int
