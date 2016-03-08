@@ -315,6 +315,11 @@ class RipConversion(object):
         return groups
 
     def find_image_texture(self, fullpath, name):
+        # Prefer png files if present
+        pngpath = re.sub(r'\.dds$', '.png', fullpath)
+        if os.path.isfile(pngpath):
+            fullpath = pngpath
+
         try:
             img = bpy.data.images.load(fullpath, True)
             for tex in bpy.data.textures:
@@ -429,7 +434,7 @@ class RipConversion(object):
 
             for i,tex in enumerate(rip.textures):
                 fullpath = os.path.join(rip.dirname, tex)
-                imgtex = self.find_image_texture(fullpath, tex)
+                imgtex = self.find_image_texture(fullpath, re.sub(r'\.dds$','',tex))
 
                 slot = mat.texture_slots.create(i)
                 slot.texture = imgtex
