@@ -47,6 +47,68 @@ def concat_attrs(datalists):
         result.append(data)
     return result
 
+class RipLogInfo(object):
+    def __init__(self, dirname):
+        self.dirname = os.path.realpath(dirname)
+        self.updir, self.filedir = os.path.split(self.dirname)
+        self.texture_stages = {}
+
+    def get_texture_stages(self, basename, texlist):
+        if basename not in self.texture_stages:
+            return None
+
+        stages = self.texture_stages[basename]
+        if len(stages.keys()) != len(texlist):
+            print('Texture count mismatch vs log for %s: %d vs %d' %
+                    (basename, len(stages.keys()), len(texlist)))
+            return None
+
+        for i,key in enumerate(stages.keys()):
+            if texlist[i] != stages[key]:
+                print('Texture name mismatch vs log for %s[%d]: %s vs %s' %
+                        (basename, i, stages[key], texlist[i]))
+                return None
+
+        return stages
+
+    def find_log(self):
+        if not os.path.isdir(self.updir):
+            return None
+
+        for file in os.listdir(self.updir):
+            if file.lower().endswith(".exe.log.txt"):
+                return os.path.join(self.updir, file)
+
+        return None
+
+    def parse_log(self):
+        logpath = self.find_log()
+        if not logpath:
+            return False
+
+        fh = open(logpath, "rt", encoding='cp437')
+        try:
+            stage_pattern = re.compile(r'^\S+\s+\S+\s+Texture stage #(\d+)\s.*\\([^\\]+)\\(Tex_\d+_\d+\.dds)\s*$')
+            mesh_pattern = re.compile(r'^\S+\s+\S+\s+Mesh saved as:.*\\([^\\]+)\\(Mesh_\d+\.rip)\s*$')
+            stage_accum = {}
+            dirmask = self.filedir.lower()
+
+            for line in fh:
+                match = mesh_pattern.fullmatch(line)
+                if match:
+                    if match.group(1).lower() == dirmask:
+                        self.texture_stages[match.group(2)] = stage_accum
+                    stage_accum = {}
+                else:
+                    match = stage_pattern.fullmatch(line)
+                    if match and match.group(2).lower() == dirmask:
+                        stage_accum[int(match.group(1))] = match.group(3)
+
+            return True
+        finally:
+            fh.close()
+
+
 class HLSLShaderInfo(object):
     def __init__(self, fname):
         self.filename = fname
@@ -99,7 +161,9 @@ class HLSLShaderInfo(object):
                             self.used_attrs[attr].add(id)
 
                 elif cmd[1].startswith('s'):
-                    self.used_samplers[cmd[1]] = cmd[0][4:]
+                    m = re.match('^s(\d+)', cmd[1])
+                    if m:
+                        self.used_samplers[int(m.group(1))] = cmd[0][4:]
 
             return True
         finally:
@@ -137,13 +201,16 @@ class RipFileAttribute(object):
             return list(map(convert, self.data))
 
 class RipFile(object):
-    def __init__(self, filename):
+    def __init__(self, filename, riplog=None):
         self.filename = filename
+        self.riplog = riplog
         self.dirname = os.path.dirname(filename)
+        self.basename = os.path.basename(filename)
         self.faces = []
         self.attributes = []
         self.shaders = []
         self.textures = []
+        self.texture_stages = None
         self.num_verts = 0
         self.shader_vert = None
         self.shader_frag = None
@@ -171,6 +238,9 @@ class RipFile(object):
 
             for i in range(num_tex):
                 self.textures.append(read_string(fh))
+
+            if self.riplog:
+                self.texture_stages = self.riplog.get_texture_stages(self.basename, self.textures)
 
             for i in range(num_shaders):
                 self.shaders.append(read_string(fh))
@@ -211,10 +281,10 @@ class RipFile(object):
     def find_attrs(self, semantic):
         return [attr for attr in self.attributes if attr.semantic == semantic]
 
-    def find_attrs_used(self, semantic):
+    def find_attrs_used(self, semantic, filter=True):
         attrs = self.find_attrs(semantic)
 
-        if self.shader_vert:
+        if self.shader_vert and filter:
             used = self.shader_vert.used_attrs
             if semantic not in used:
                 return []
@@ -222,9 +292,25 @@ class RipFile(object):
 
         return attrs
 
-    def has_textures(self):
-        do_textures = (not self.shader_frag or len(self.shader_frag.used_samplers) > 0)
-        return do_textures and len(self.textures) > 0
+    def get_textures(self, filter=True):
+        samplers = None
+        if self.shader_frag and filter:
+            samplers = self.shader_frag.used_samplers
+        if samplers and len(samplers) == 0:
+            return {}
+
+        stages = self.texture_stages
+
+        if not stages:
+            return dict(enumerate(self.textures))
+        else:
+            if filter:
+                return dict([(id,stages[id]) for id in stages.keys() if id in samplers])
+            else:
+                return stages
+
+    def has_textures(self, filter=True):
+        return len(self.get_textures(filter)) > 0
 
 
 class RipConversion(object):
@@ -233,6 +319,8 @@ class RipConversion(object):
         self.flip_winding = False
         self.use_normals = True
         self.use_weights = True
+        self.filter_unused_attrs = True
+        self.filter_unused_textures = True
         self.normal_max_int = 255
         self.normal_scale = [(1.0, 0.0)] * 3
         self.uv_max_int = 255
@@ -245,7 +333,7 @@ class RipConversion(object):
         return (self.scale_normal(0,norm[0]), self.scale_normal(1,norm[1]), self.scale_normal(2,norm[2]))
 
     def find_normals(self, rip):
-        return rip.find_attrs_used('NORMAL')
+        return rip.find_attrs_used('NORMAL', self.filter_unused_attrs)
 
     def get_normals(self, rip):
         normals = self.find_normals(rip)
@@ -264,7 +352,7 @@ class RipConversion(object):
         return (self.scale_uv(0,uv[0]), self.scale_uv(1,uv[1]))
 
     def find_uv_maps(self, rip):
-        return rip.find_attrs_used('TEXCOORD')
+        return rip.find_attrs_used('TEXCOORD', self.filter_unused_attrs)
 
     def get_uv_maps(self, rip):
         maps = self.find_uv_maps(rip)
@@ -290,11 +378,11 @@ class RipConversion(object):
         return result_maps
 
     def find_colors(self, rip):
-        return rip.find_attrs_used('COLOR')
+        return rip.find_attrs_used('COLOR', self.filter_unused_attrs)
 
     def get_weight_groups(self, rip):
-        indices = rip.find_attrs_used('BLENDINDICES')
-        weights = rip.find_attrs_used('BLENDWEIGHT')
+        indices = rip.find_attrs_used('BLENDINDICES', self.filter_unused_attrs)
+        weights = rip.find_attrs_used('BLENDWEIGHT', self.filter_unused_attrs)
         if len(indices) == 0 or len(weights) == 0:
             return {}
 
@@ -338,7 +426,7 @@ class RipConversion(object):
             return bpy.data.textures.new(name, type='IMAGE')
 
     def apply_matrix(self, vec):
-        return self.matrix * Vector(vec)
+        return self.matrix * Vector(vec).to_3d()
 
     def apply_matrix_list(self, lst):
         return list(map(self.apply_matrix, lst))
@@ -428,17 +516,21 @@ class RipConversion(object):
             bm.free()
 
         # Textures
-        if rip.has_textures():
+        texset = rip.get_textures(self.filter_unused_textures)
+        if len(texset) > 0:
             mat = bpy.data.materials.new(obj_name)
             mesh.materials.append(mat)
 
-            for i,tex in enumerate(rip.textures):
+            first = True
+            for i in texset.keys():
+                tex = texset[i]
                 fullpath = os.path.join(rip.dirname, tex)
                 imgtex = self.find_image_texture(fullpath, re.sub(r'\.dds$','',tex))
 
                 slot = mat.texture_slots.create(i)
                 slot.texture = imgtex
-                slot.use = (i == 0)
+                slot.use = first
+                first = False
 
         # Finalize
         for i in range(len(rip.shaders)):
@@ -532,6 +624,16 @@ class RipImporter(bpy.types.Operator, ImportHelper, IORIPOrientationHelper):
         description="Scan the dumped shader code to filter unused attributes"
     )
 
+    filter_unused_attrs = BoolProperty(
+        default=True, name="Skip unused attributes",
+        description="Do not import attributes unused in the current shader"
+    )
+
+    filter_unused_textures = BoolProperty(
+        default=True, name="Skip unused textures",
+        description="Do not import textures unused in the current shader"
+    )
+
     skip_untextured = BoolProperty(
         default=False, name="Skip if untextured",
         description="Skip meshes that don't have or use any textures"
@@ -549,7 +651,6 @@ class RipImporter(bpy.types.Operator, ImportHelper, IORIPOrientationHelper):
 
         misc = self.layout.box()
         misc.prop(self, "use_weights")
-        misc.prop(self, "use_shaders")
         misc.prop(self, "skip_untextured")
 
         uv = self.layout.box()
@@ -566,6 +667,13 @@ class RipImporter(bpy.types.Operator, ImportHelper, IORIPOrientationHelper):
             row = norm.row()
             row.column().prop(self, "normal_mul")
             row.column().prop(self, "normal_add")
+
+        shd = self.layout.box()
+        shd.prop(self, "use_shaders")
+        if self.use_shaders:
+            shd.prop(self, "filter_unused_attrs")
+            shd.prop(self, "filter_unused_textures")
+
 
     def get_normal_scale(self, i):
         return (self.normal_mul[i], self.normal_add[i])
@@ -586,6 +694,8 @@ class RipImporter(bpy.types.Operator, ImportHelper, IORIPOrientationHelper):
         conv.flip_winding = self.flip_winding
         conv.use_normals = self.use_normals
         conv.use_weights = self.use_weights
+        conv.filter_unused_attrs = self.filter_unused_attrs
+        conv.filter_unused_textures = self.filter_unused_textures
         conv.normal_max_int = self.normal_int
         conv.normal_scale = list(map(self.get_normal_scale, range(3)))
         conv.uv_max_int = self.uv_int
@@ -593,8 +703,14 @@ class RipImporter(bpy.types.Operator, ImportHelper, IORIPOrientationHelper):
 
         dirname = os.path.dirname(self.filepath)
 
+        riplog = None
+        if self.use_shaders:
+            log = RipLogInfo(dirname)
+            if log.parse_log():
+                riplog = log
+
         for file in self.files:
-            rf = RipFile(os.path.join(dirname, file.name))
+            rf = RipFile(os.path.join(dirname, file.name), riplog)
             rf.parse_file()
             if self.use_shaders:
                 rf.parse_shaders()
