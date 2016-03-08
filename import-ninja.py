@@ -12,6 +12,7 @@ import bmesh
 import re
 import glob
 import os
+import hashlib
 
 from struct import *
 
@@ -187,6 +188,9 @@ class RipFileAttribute(object):
         self.format = format
         self.data = []
 
+    def get_hashtag(self):
+        return "[%s:%d:%d:%d:%s]" % (self.semantic, self.semantic_index, self.offset, self.size, self.format)
+
     def parse_vertex(self, buffer):
         self.data.append(unpack(self.format, buffer[self.offset : self.end]))
 
@@ -214,6 +218,7 @@ class RipFile(object):
         self.num_verts = 0
         self.shader_vert = None
         self.shader_frag = None
+        self.data_hash = ""
 
     def parse_file(self):
         fh = open(self.filename, "rb")
@@ -233,8 +238,12 @@ class RipFile(object):
             num_shaders = read_uint(fh)
             num_attrs = read_uint(fh)
 
+            datahash = hashlib.sha1()
+
             for i in range(num_attrs):
-                self.attributes.append(RipFileAttribute(fh))
+                attr = RipFileAttribute(fh)
+                self.attributes.append(attr)
+                datahash.update(attr.get_hashtag().encode('utf-8'))
 
             for i in range(num_tex):
                 self.textures.append(read_string(fh))
@@ -246,16 +255,23 @@ class RipFile(object):
                 self.shaders.append(read_string(fh))
 
             for i in range(num_faces):
-                face = unpack('III', fh.read(4*3))
+                data = fh.read(4*3)
+                face = unpack('III', data)
 
                 # Omit degenerate triangles - they are sometimes used to merge strips
                 if face[0] != face[1] and face[1] != face[2] and face[0] != face[2]:
                     self.faces.append(face)
+                    datahash.update(data)
+
+            datahash.update(b"|")
 
             for i in range(self.num_verts):
                 data = fh.read(block_size)
+                datahash.update(data)
                 for attr in self.attributes:
                     attr.parse_vertex(data)
+
+            self.data_hash = datahash.hexdigest()
         finally:
             fh.close()
 
@@ -281,14 +297,18 @@ class RipFile(object):
     def find_attrs(self, semantic):
         return [attr for attr in self.attributes if attr.semantic == semantic]
 
+    def is_used_attr(self, attr):
+        if not self.shader_vert:
+            return True
+
+        used = self.shader_vert.used_attrs
+        return attr.semantic in used and attr.semantic_index in used[attr.semantic]
+
     def find_attrs_used(self, semantic, filter=True):
         attrs = self.find_attrs(semantic)
 
         if self.shader_vert and filter:
-            used = self.shader_vert.used_attrs
-            if semantic not in used:
-                return []
-            return [attr for attr in attrs if attr.semantic_index in used[semantic]]
+            return [attr for attr in attrs if self.is_used_attr(attr)]
 
         return attrs
 
@@ -325,6 +345,8 @@ class RipConversion(object):
         self.normal_scale = [(1.0, 0.0)] * 3
         self.uv_max_int = 255
         self.uv_scale = [(1.0, 0.0)] * 2
+        self.filter_duplicates = False
+        self.mesh_table = {}
 
     def scale_normal(self, comp, val):
         return val * self.normal_scale[comp][0] + self.normal_scale[comp][1]
@@ -431,7 +453,7 @@ class RipConversion(object):
     def apply_matrix_list(self, lst):
         return list(map(self.apply_matrix, lst))
 
-    def convert_object(self, rip, scene, obj_name):
+    def convert_mesh(self, rip, obj_name):
         pos_attrs = rip.find_attrs('POSITION')
         if len(pos_attrs) == 0:
             pos_attrs = rip.attributes[0:1]
@@ -533,10 +555,39 @@ class RipConversion(object):
                 first = False
 
         # Finalize
-        for i in range(len(rip.shaders)):
-            mesh["shader_"+str(i)] = rip.shaders[i]
-
         mesh.update()
+
+        return mesh, vgroup_names
+
+    def duplicate_detection_key(self, rip):
+        items = [rip.data_hash]
+
+        if self.filter_unused_attrs and rip.shader_vert:
+            indices = [str(i) for i in range(len(rip.attributes)) if rip.is_used_attr(rip.attributes[i])]
+            items.append(','.join(indices))
+
+        texset = rip.get_textures(self.filter_unused_textures)
+        items.extend([texset[k] for k in sorted(texset)])
+
+        return '|'.join(items)
+
+    def convert_mesh_nodup(self, rip, obj_name):
+        dupkey = self.duplicate_detection_key(rip)
+
+        if dupkey in self.mesh_table:
+            if self.filter_duplicates:
+                return None, None
+            else:
+                return self.mesh_table[dupkey]
+
+        newmesh = self.convert_mesh(rip, obj_name)
+        self.mesh_table[dupkey] = newmesh
+        return newmesh
+
+    def convert_object(self, rip, scene, obj_name):
+        mesh, vgroup_names = self.convert_mesh_nodup(rip, obj_name)
+        if mesh is None:
+            return None
 
         # Create and select object
         for o in scene.objects:
@@ -546,6 +597,9 @@ class RipConversion(object):
 
         for vname in vgroup_names:
             nobj.vertex_groups.new(vname)
+
+        for i in range(len(rip.shaders)):
+            nobj["shader_"+str(i)] = rip.shaders[i]
 
         scene.objects.link(nobj)
         scene.update()
@@ -636,7 +690,12 @@ class RipImporter(bpy.types.Operator, ImportHelper, IORIPOrientationHelper):
 
     skip_untextured = BoolProperty(
         default=False, name="Skip if untextured",
-        description="Skip meshes that don't have or use any textures"
+        description="Skip meshes that don't use any textures (e.g. from zbuffer prefill pass)"
+    )
+
+    skip_duplicates = BoolProperty(
+        default=False, name="Skip duplicates",
+        description="Skip meshes that have exactly the same data, shaders and textures"
     )
 
     def draw(self, context):
@@ -652,6 +711,7 @@ class RipImporter(bpy.types.Operator, ImportHelper, IORIPOrientationHelper):
         misc = self.layout.box()
         misc.prop(self, "use_weights")
         misc.prop(self, "skip_untextured")
+        misc.prop(self, "skip_duplicates")
 
         uv = self.layout.box()
         uv.prop(self, "uv_int")
@@ -696,6 +756,7 @@ class RipImporter(bpy.types.Operator, ImportHelper, IORIPOrientationHelper):
         conv.use_weights = self.use_weights
         conv.filter_unused_attrs = self.filter_unused_attrs
         conv.filter_unused_textures = self.filter_unused_textures
+        conv.filter_duplicates = self.skip_duplicates
         conv.normal_max_int = self.normal_int
         conv.normal_scale = list(map(self.get_normal_scale, range(3)))
         conv.uv_max_int = self.uv_int
