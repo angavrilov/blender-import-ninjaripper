@@ -4,7 +4,7 @@ import bpy_extras
 import mathutils
 
 from mathutils import Vector, Matrix
-from bpy_extras.io_utils import ImportHelper, orientation_helper_factory, axis_conversion
+from bpy_extras.io_utils import ImportHelper, orientation_helper_factory, axis_conversion, _check_axis_conversion
 from bpy.props import *
 
 import bmesh
@@ -304,14 +304,6 @@ class RipFile(object):
         used = self.shader_vert.used_attrs
         return attr.semantic in used and attr.semantic_index in used[attr.semantic]
 
-    def find_attrs_used(self, semantic, filter=True):
-        attrs = self.find_attrs(semantic)
-
-        if self.shader_vert and filter:
-            return [attr for attr in attrs if self.is_used_attr(attr)]
-
-        return attrs
-
     def get_textures(self, filter=True):
         samplers = None
         if self.shader_frag and filter:
@@ -347,6 +339,24 @@ class RipConversion(object):
         self.uv_scale = [(1.0, 0.0)] * 2
         self.filter_duplicates = False
         self.mesh_table = {}
+        self.attr_override_table = None
+
+    def find_attrs(self, rip, semantic):
+        if self.attr_override_table:
+            if semantic in self.attr_override_table:
+                return [rip.attributes[i] for i in self.attr_override_table[semantic] if i < len(rip.attributes)]
+            else:
+                return []
+        else:
+            return rip.find_attrs(semantic)
+
+    def find_attrs_used(self, rip, semantic, filter=True):
+        attrs = self.find_attrs(rip, semantic)
+
+        if rip.shader_vert and filter:
+            return [attr for attr in attrs if rip.is_used_attr(attr)]
+
+        return attrs
 
     def scale_normal(self, comp, val):
         return val * self.normal_scale[comp][0] + self.normal_scale[comp][1]
@@ -355,7 +365,7 @@ class RipConversion(object):
         return (self.scale_normal(0,norm[0]), self.scale_normal(1,norm[1]), self.scale_normal(2,norm[2]))
 
     def find_normals(self, rip):
-        return rip.find_attrs_used('NORMAL', self.filter_unused_attrs)
+        return self.find_attrs_used(rip, 'NORMAL', self.filter_unused_attrs)
 
     def get_normals(self, rip):
         normals = self.find_normals(rip)
@@ -374,7 +384,7 @@ class RipConversion(object):
         return (self.scale_uv(0,uv[0]), self.scale_uv(1,uv[1]))
 
     def find_uv_maps(self, rip):
-        return rip.find_attrs_used('TEXCOORD', self.filter_unused_attrs)
+        return self.find_attrs_used(rip, 'TEXCOORD', self.filter_unused_attrs)
 
     def get_uv_maps(self, rip):
         maps = self.find_uv_maps(rip)
@@ -400,11 +410,11 @@ class RipConversion(object):
         return result_maps
 
     def find_colors(self, rip):
-        return rip.find_attrs_used('COLOR', self.filter_unused_attrs)
+        return self.find_attrs_used(rip, 'COLOR', self.filter_unused_attrs)
 
     def get_weight_groups(self, rip):
-        indices = rip.find_attrs_used('BLENDINDICES', self.filter_unused_attrs)
-        weights = rip.find_attrs_used('BLENDWEIGHT', self.filter_unused_attrs)
+        indices = self.find_attrs_used(rip, 'BLENDINDICES', self.filter_unused_attrs)
+        weights = self.find_attrs_used(rip, 'BLENDWEIGHT', self.filter_unused_attrs)
         if len(indices) == 0 or len(weights) == 0:
             return {}
 
@@ -454,7 +464,7 @@ class RipConversion(object):
         return list(map(self.apply_matrix, lst))
 
     def convert_mesh(self, rip, obj_name):
-        pos_attrs = rip.find_attrs('POSITION')
+        pos_attrs = self.find_attrs(rip, 'POSITION')
         if len(pos_attrs) == 0:
             pos_attrs = rip.attributes[0:1]
 
@@ -609,7 +619,7 @@ class RipConversion(object):
 
         return nobj
 
-IORIPOrientationHelper = orientation_helper_factory("IORIPOrientationHelper", axis_forward='-Z', axis_up='Y')
+IORIPOrientationHelper = orientation_helper_factory("IORIPOrientationHelper", axis_forward='Y', axis_up='Z')
 
 class RipImporter(bpy.types.Operator, ImportHelper, IORIPOrientationHelper):
     """Load Ninja Ripper mesh data"""
@@ -698,6 +708,53 @@ class RipImporter(bpy.types.Operator, ImportHelper, IORIPOrientationHelper):
         description="Skip meshes that have exactly the same data, shaders and textures"
     )
 
+    override_attrs = BoolProperty(
+        default=False, name="Override attribute types",
+        description="Manually specify which attribute indices to use for what data"
+    )
+
+    override_pos = StringProperty(
+        default="0", name="Position", description="Attribute index specifying position"
+    )
+    override_normal = StringProperty(
+        default="1", name="Normal", description="Attribute index specifying normal"
+    )
+    override_uv = StringProperty(
+        default="2", name="UV", description="Comma-separated attribute indices specifying UV coordinates"
+    )
+    override_color = StringProperty(
+        default="", name="Color", description="Comma-separated attribute indices specifying vertex colors"
+    )
+    override_index = StringProperty(
+        default="", name="Index", description="Comma-separated attribute indices specifying blend indices"
+    )
+    override_weight = StringProperty(
+        default="", name="Weight", description="Comma-separated attribute indices specifying blend weights"
+    )
+
+    override_props = [
+        ('POSITION', 'override_pos'),
+        ('NORMAL', 'override_normal'),
+        ('TEXCOORD', 'override_uv'),
+        ('COLOR', 'override_color'),
+        ('BLENDINDICES', 'override_index'),
+        ('BLENDWEIGHT', 'override_weight')
+    ]
+
+    def check(self, context):
+        change = _check_axis_conversion(self)
+
+        for tag, prop in self.override_props:
+            val = getattr(self, prop)
+            newval = re.sub(r'[^0-9,]','',val)
+            newval = re.sub(r'(^,+|,+$)','',newval)
+            newval = re.sub(r',,+',',',newval)
+            if newval != val:
+                setattr(self, prop, newval)
+                change = True
+
+        return change
+
     def draw(self, context):
         self.layout.operator('file.select_all_toggle')
 
@@ -734,6 +791,16 @@ class RipImporter(bpy.types.Operator, ImportHelper, IORIPOrientationHelper):
             shd.prop(self, "filter_unused_attrs")
             shd.prop(self, "filter_unused_textures")
 
+        ovr = self.layout.box()
+        ovr.prop(self, "override_attrs")
+        if self.override_attrs:
+            ovr.prop(self, "override_pos")
+            ovr.prop(self, "override_normal")
+            ovr.prop(self, "override_uv")
+            ovr.prop(self, "override_color")
+            ovr.prop(self, "override_index")
+            ovr.prop(self, "override_weight")
+
 
     def get_normal_scale(self, i):
         return (self.normal_mul[i], self.normal_add[i])
@@ -750,6 +817,7 @@ class RipImporter(bpy.types.Operator, ImportHelper, IORIPOrientationHelper):
             matrix = Matrix.Scale(-1, 3, (1.0, 0.0, 0.0)) * matrix
 
         conv = RipConversion()
+
         conv.matrix = matrix
         conv.flip_winding = self.flip_winding
         conv.use_normals = self.use_normals
@@ -761,6 +829,14 @@ class RipImporter(bpy.types.Operator, ImportHelper, IORIPOrientationHelper):
         conv.normal_scale = list(map(self.get_normal_scale, range(3)))
         conv.uv_max_int = self.uv_int
         conv.uv_scale = list(map(self.get_uv_scale, range(2)))
+
+        if self.override_attrs:
+            table = {}
+            for tag, prop in self.override_props:
+                vals = getattr(self, prop).split(',')
+                nums = map(int, filter(lambda s: re.fullmatch(r'^\d+$',s), vals))
+                table[tag] = list(nums)
+            conv.attr_override_table = table
 
         dirname = os.path.dirname(self.filepath)
 
@@ -782,8 +858,7 @@ class RipImporter(bpy.types.Operator, ImportHelper, IORIPOrientationHelper):
         return {'FINISHED'}
 
     def invoke(self, context, event):
-        wm = context.window_manager
-        wm.fileselect_add(self)
+        context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
 
