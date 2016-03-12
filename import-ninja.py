@@ -49,63 +49,81 @@ def concat_attrs(datalists):
     return result
 
 class RipLogInfo(object):
-    def __init__(self, dirname):
-        self.dirname = os.path.realpath(dirname)
-        self.updir, self.filedir = os.path.split(self.dirname)
-        self.texture_stages = {}
+    def __init__(self):
+        self.log_file_cache = {}
 
-    def get_texture_stages(self, basename, texlist):
-        if basename not in self.texture_stages:
-            return None
-
-        stages = self.texture_stages[basename]
+    def verify_texture_match(self, basename, stages, texlist):
         if len(stages.keys()) != len(texlist):
             print('Texture count mismatch vs log for %s: %d vs %d' %
                     (basename, len(stages.keys()), len(texlist)))
-            return None
+            return False
 
         for i,key in enumerate(stages.keys()):
-            if texlist[i] != stages[key]:
+            if texlist[i].lower() != stages[key].lower():
                 print('Texture name mismatch vs log for %s[%d]: %s vs %s' %
                         (basename, i, stages[key], texlist[i]))
-                return None
+                return False
 
-        return stages
+        return True
 
-    def find_log(self):
-        if not os.path.isdir(self.updir):
+    def get_texture_stages(self, filename, texlist):
+        dirname, basename = os.path.split(os.path.realpath(filename))
+        if dirname == '' or basename == '':
             return None
 
-        for file in os.listdir(self.updir):
+        logdir, subdir = os.path.split(dirname)
+        if logdir == '' or subdir == '':
+            return None
+
+        logkey = logdir.lower()
+        if logkey not in self.log_file_cache:
+            self.log_file_cache[logkey] = self.parse_log(logdir)
+
+        logtable = self.log_file_cache[logkey]
+        filetable = logtable.get(subdir.lower(), {})
+        stages = filetable.get(basename.lower(), None)
+
+        if stages and self.verify_texture_match(filename, stages, texlist):
+            return stages
+        else:
+            return None
+
+    def find_log(self, logdir):
+        if not os.path.isdir(logdir):
+            return None
+
+        for file in os.listdir(logdir):
             if file.lower().endswith(".exe.log.txt"):
-                return os.path.join(self.updir, file)
+                return os.path.join(logdir, file)
 
         return None
 
-    def parse_log(self):
-        logpath = self.find_log()
+    def parse_log(self, logdir):
+        logpath = self.find_log(logdir)
         if not logpath:
-            return False
+            return {}
 
         fh = open(logpath, "rt", encoding='cp437')
         try:
             stage_pattern = re.compile(r'^\S+\s+\S+\s+Texture stage #(\d+)\s.*\\([^\\]+)\\(Tex_\d+_\d+\.dds)\s*$')
             mesh_pattern = re.compile(r'^\S+\s+\S+\s+Mesh saved as:.*\\([^\\]+)\\(Mesh_\d+\.rip)\s*$')
+            logtable = {}
             stage_accum = {}
-            dirmask = self.filedir.lower()
 
             for line in fh:
                 match = mesh_pattern.fullmatch(line)
                 if match:
-                    if match.group(1).lower() == dirmask:
-                        self.texture_stages[match.group(2)] = stage_accum
+                    subdir = match.group(1).lower()
+                    if subdir not in logtable:
+                        logtable[subdir] = {}
+                    logtable[subdir][match.group(2).lower()] = stage_accum
                     stage_accum = {}
                 else:
                     match = stage_pattern.fullmatch(line)
-                    if match and match.group(2).lower() == dirmask:
+                    if match:
                         stage_accum[int(match.group(1))] = match.group(3)
 
-            return True
+            return logtable
         finally:
             fh.close()
 
@@ -249,7 +267,7 @@ class RipFile(object):
                 self.textures.append(read_string(fh))
 
             if self.riplog:
-                self.texture_stages = self.riplog.get_texture_stages(self.basename, self.textures)
+                self.texture_stages = self.riplog.get_texture_stages(self.filename, self.textures)
 
             for i in range(num_shaders):
                 self.shaders.append(read_string(fh))
@@ -629,6 +647,7 @@ class RipImporter(bpy.types.Operator, ImportHelper, IORIPOrientationHelper):
 
     filename_ext = ".rip"
     filter_glob = StringProperty(default="*.rip", options={'HIDDEN'})
+    directory = StringProperty(options={'HIDDEN'})
     files = CollectionProperty(name="File Path", type=bpy.types.OperatorFileListElement)
 
     flip_x_axis = BoolProperty(
@@ -812,6 +831,10 @@ class RipImporter(bpy.types.Operator, ImportHelper, IORIPOrientationHelper):
             return (self.uv_mul[i], self.uv_add[i])
 
     def execute(self, context):
+        if len(self.files) == 0 or not os.path.isfile(os.path.join(self.directory,self.files[0].name)):
+            self.report({'ERROR'}, 'No file is selected for import')
+            return {'FINISHED'}
+
         matrix = axis_conversion(from_forward=self.axis_forward, from_up=self.axis_up)
         if self.flip_x_axis:
             matrix = Matrix.Scale(-1, 3, (1.0, 0.0, 0.0)) * matrix
@@ -838,16 +861,10 @@ class RipImporter(bpy.types.Operator, ImportHelper, IORIPOrientationHelper):
                 table[tag] = list(nums)
             conv.attr_override_table = table
 
-        dirname = os.path.dirname(self.filepath)
-
-        riplog = None
-        if self.use_shaders:
-            log = RipLogInfo(dirname)
-            if log.parse_log():
-                riplog = log
+        riplog = RipLogInfo() if self.use_shaders else None
 
         for file in self.files:
-            rf = RipFile(os.path.join(dirname, file.name), riplog)
+            rf = RipFile(os.path.join(self.directory, file.name), riplog)
             rf.parse_file()
             if self.use_shaders:
                 rf.parse_shaders()
