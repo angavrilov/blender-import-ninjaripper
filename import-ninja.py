@@ -19,7 +19,7 @@ from struct import *
 bl_info = {
     "name": "Ninja Ripper mesh data (.rip)",
     "author": "Alexander Gavrilov",
-    "version": (0, 1),
+    "version": (0, 2),
     "blender": (2, 77, 0),
     "location": "File > Import-Export > Ninja Ripper (.rip) ",
     "description": "Import Ninja Ripper mesh data",
@@ -342,6 +342,181 @@ class RipFile(object):
     def has_textures(self, filter=True):
         return len(self.get_textures(filter)) > 0
 
+class BaseDuplicateTracker(object):
+    def __init__(self):
+        self.file_hashes = {}
+        self.hash_missing_textures = True
+
+    def hash_file(self, fname):
+        if not os.path.isfile(fname):
+            return None
+
+        try:
+            hash = hashlib.sha1()
+            with open(fname, "rb") as f:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    hash.update(chunk)
+            return hash.hexdigest()
+        except IOError as e:
+            print("I/O error(%d): %s" % (e.errno, e.strerror))
+            return None
+
+    def get_file_hash(self, filename):
+        fullpath = os.path.realpath(filename)
+        if fullpath in self.file_hashes:
+            return self.file_hashes[fullpath]
+
+        hash = self.hash_file(fullpath)
+        self.file_hashes[fullpath] = hash
+        return hash
+
+    def is_sharing_mesh(self):
+        return False
+
+    def create_texture(self, fullpath):
+        try:
+            teximage = bpy.data.images.load(fullpath, True)
+            if teximage.users > 0:
+                for tex in bpy.data.textures:
+                    if tex.type == 'IMAGE' and tex.image == teximage:
+                        return tex
+
+            name,ext = os.path.splitext(os.path.basename(fullpath))
+            texobj = bpy.data.textures.new(name, type='IMAGE')
+            texobj.image = teximage
+            return texobj
+
+        except Exception as e:
+            for tex in bpy.data.textures:
+                if tex.type == 'IMAGE' and tex.name == fullpath:
+                    return tex
+
+            return bpy.data.textures.new(fullpath, type='IMAGE')
+
+    def get_texture_path(self, fullpath):
+        fullpath = os.path.realpath(fullpath)
+
+        # Prefer png files if present
+        pngpath = re.sub(r'\.dds$', '.png', fullpath)
+        if os.path.isfile(pngpath):
+            fullpath = pngpath
+
+        return fullpath
+
+    def get_texture(self, fullpath):
+        return self.create_texture(self.get_texture_path(fullpath))
+
+    def material_hash(self, rip, texset):
+        hash = hashlib.sha1()
+        #hash = ""
+
+        for i in sorted(texset.keys()):
+            path = os.path.join(rip.dirname, texset[i])
+            texhash = self.get_file_hash(self.get_texture_path(path))
+            if texhash is None:
+                texhash = os.path.realpath(path) if self.hash_missing_textures else "?"
+            chunk = "%d:%s;" % (i,texhash)
+            #hash = hash + chunk
+            hash.update(chunk.encode("utf-8"))
+
+        return hash.hexdigest()
+
+    def get_material(self, rip, texset):
+        mat = bpy.data.materials.new(rip.basename)
+
+        first = True
+        for i in texset.keys():
+            tex = texset[i]
+            imgtex = self.get_texture(os.path.join(rip.dirname, tex))
+
+            slot = mat.texture_slots.create(i)
+            slot.texture = imgtex
+            slot.use = first
+            first = False
+
+        mat['ninjarip_datakey'] = self.material_hash(rip, texset)
+        return mat
+
+    def get_mesh(self, key, callback):
+        mesh = callback()
+        mesh['ninjarip_datakey'] = key
+        return mesh
+
+    def get_object(self, key, callback):
+        obj = callback()
+        obj['ninjarip_datakey'] = key
+        return obj
+
+
+class DuplicateTracker(BaseDuplicateTracker):
+    def __init__(self):
+        super(DuplicateTracker,self).__init__()
+        self.texture_duptable = {}
+        self.material_duptable = {}
+        self.mesh_duptable = {}
+        self.obj_duptable = {}
+
+    def create_texture(self, fullpath):
+        texhash = self.get_file_hash(fullpath)
+        if texhash is not None and texhash in self.texture_duptable:
+            return self.texture_duptable[texhash]
+
+        texobj = super(DuplicateTracker,self).create_texture(fullpath)
+
+        if texhash is not None:
+            texobj['ninjarip_datakey'] = texhash
+            self.texture_duptable[texhash] = texobj
+
+        return texobj
+
+    def get_material(self, rip, texset):
+        mathash = self.material_hash(rip, texset)
+        if mathash in self.material_duptable:
+            return self.material_duptable[mathash]
+
+        mat = super(DuplicateTracker,self).get_material(rip, texset)
+        mat['ninjarip_datakey'] = mathash
+        self.material_duptable[mathash] = mat
+        return mat
+
+    def is_sharing_mesh(self):
+        return True
+
+    def get_mesh(self, key, callback):
+        if key in self.mesh_duptable:
+            return self.mesh_duptable[key]
+
+        mesh = callback()
+        mesh['ninjarip_datakey'] = key
+        self.mesh_duptable[key] = mesh
+        return mesh
+
+    def get_object(self, key, callback):
+        if key in self.obj_duptable:
+            return self.obj_duptable[key]
+
+        obj = callback()
+        obj['ninjarip_datakey'] = key
+        self.obj_duptable[key] = obj
+        return obj
+
+    def init_duplicate_tables(self):
+        for tex in bpy.data.textures:
+            if tex.type == 'IMAGE' and 'ninjarip_datakey' in tex:
+                self.texture_duptable[tex['ninjarip_datakey']] = tex
+
+        for mat in bpy.data.materials:
+            if 'ninjarip_datakey' in mat:
+                self.material_duptable[mat['ninjarip_datakey']] = mat
+
+        for mesh in bpy.data.meshes:
+            if 'ninjarip_datakey' in mesh:
+                self.mesh_duptable[mesh['ninjarip_datakey']] = mesh
+
+        for obj in bpy.data.objects:
+            if 'ninjarip_datakey' in obj:
+                self.obj_duptable[obj['ninjarip_datakey']] = obj
+
 
 class RipConversion(object):
     def __init__(self):
@@ -356,8 +531,8 @@ class RipConversion(object):
         self.uv_max_int = 255
         self.uv_scale = [(1.0, 0.0)] * 2
         self.filter_duplicates = False
-        self.mesh_table = {}
         self.attr_override_table = None
+        self.dedup = BaseDuplicateTracker()
 
     def find_attrs(self, rip, semantic):
         if self.attr_override_table:
@@ -452,36 +627,13 @@ class RipConversion(object):
 
         return groups
 
-    def find_image_texture(self, fullpath, name):
-        # Prefer png files if present
-        pngpath = re.sub(r'\.dds$', '.png', fullpath)
-        if os.path.isfile(pngpath):
-            fullpath = pngpath
-
-        try:
-            img = bpy.data.images.load(fullpath, True)
-            for tex in bpy.data.textures:
-                if tex.type == 'IMAGE' and tex.image == img:
-                    return tex
-
-            tex = bpy.data.textures.new(name, type='IMAGE')
-            tex.image = img
-            return tex
-
-        except:
-            for tex in bpy.data.textures:
-                if tex.type == 'IMAGE' and tex.name == name:
-                    return tex
-
-            return bpy.data.textures.new(name, type='IMAGE')
-
     def apply_matrix(self, vec):
         return self.matrix * Vector(vec).to_3d()
 
     def apply_matrix_list(self, lst):
         return list(map(self.apply_matrix, lst))
 
-    def convert_mesh(self, rip, obj_name):
+    def convert_mesh(self, rip):
         pos_attrs = self.find_attrs(rip, 'POSITION')
         if len(pos_attrs) == 0:
             pos_attrs = rip.attributes[0:1]
@@ -494,7 +646,7 @@ class RipConversion(object):
             faces = list(map(lambda f: (f[1],f[0],f[2]), faces))
 
         # Create mesh
-        mesh = bpy.data.meshes.new(obj_name)
+        mesh = bpy.data.meshes.new(rip.basename)
         mesh.from_pydata(vert_pos, [], faces)
 
         # Assign normals
@@ -552,9 +704,9 @@ class RipConversion(object):
             if self.use_weights:
                 groups = self.get_weight_groups(rip)
 
-                for group in groups.keys():
+                for group in sorted(groups.keys()):
                     id = len(vgroup_names)
-                    vgroup_names.append('blendweight'+str(group))
+                    vgroup_names.append(str(group))
                     layer = bm.verts.layers.deform.verify()
                     weights = groups[group]
 
@@ -565,72 +717,76 @@ class RipConversion(object):
         finally:
             bm.free()
 
-        # Textures
-        texset = rip.get_textures(self.filter_unused_textures)
-        if len(texset) > 0:
-            mat = bpy.data.materials.new(obj_name)
-            mesh.materials.append(mat)
-
-            first = True
-            for i in texset.keys():
-                tex = texset[i]
-                fullpath = os.path.join(rip.dirname, tex)
-                imgtex = self.find_image_texture(fullpath, re.sub(r'\.dds$','',tex))
-
-                slot = mat.texture_slots.create(i)
-                slot.texture = imgtex
-                slot.use = first
-                first = False
-
         # Finalize
         mesh.update()
 
-        return mesh, vgroup_names
+        if self.dedup.is_sharing_mesh():
+            mesh.materials.append(None)
 
-    def duplicate_detection_key(self, rip):
-        items = [rip.data_hash]
+        if len(vgroup_names) > 0:
+            mesh["ninjarip_vgroups"] = ','.join(vgroup_names);
 
+        return mesh
+
+    def mesh_datakey(self, rip):
+        key = rip.data_hash
         if self.filter_unused_attrs and rip.shader_vert:
             indices = [str(i) for i in range(len(rip.attributes)) if rip.is_used_attr(rip.attributes[i])]
-            items.append(','.join(indices))
+            key = key + ':' + ','.join(indices)
+        return key
 
-        texset = rip.get_textures(self.filter_unused_textures)
-        items.extend([texset[k] for k in sorted(texset)])
-
-        return '|'.join(items)
-
-    def convert_mesh_nodup(self, rip, obj_name):
-        dupkey = self.duplicate_detection_key(rip)
-
-        if dupkey in self.mesh_table:
-            if self.filter_duplicates:
-                return None, None
-            else:
-                return self.mesh_table[dupkey]
-
-        newmesh = self.convert_mesh(rip, obj_name)
-        self.mesh_table[dupkey] = newmesh
-        return newmesh
-
-    def convert_object(self, rip, scene, obj_name):
-        mesh, vgroup_names = self.convert_mesh_nodup(rip, obj_name)
-        if mesh is None:
-            return None
-
-        # Create and select object
-        for o in scene.objects:
-            o.select = False
-
+    def create_object(self, rip, obj_name, mesh, mat):
         nobj = bpy.data.objects.new(obj_name, mesh)
 
-        for vname in vgroup_names:
-            nobj.vertex_groups.new(vname)
+        if mat:
+            if self.dedup.is_sharing_mesh():
+                nobj.material_slots[0].link = 'OBJECT'
+                nobj.material_slots[0].material = mat
+            else:
+                mesh.materials.append(mat)
+
+        if 'ninjarip_vgroups' in mesh:
+            for vname in mesh["ninjarip_vgroups"].split(','):
+                nobj.vertex_groups.new('blendweight'+vname)
 
         for i in range(len(rip.shaders)):
             nobj["shader_"+str(i)] = rip.shaders[i]
 
-        scene.objects.link(nobj)
-        scene.update()
+        return nobj
+
+    def convert_object(self, rip, scene, obj_name):
+        mesh_key = self.mesh_datakey(rip)
+        mesh = self.dedup.get_mesh(mesh_key, lambda: self.convert_mesh(rip))
+
+        # Textures
+        texset = rip.get_textures(self.filter_unused_textures)
+
+        mat = None
+        matkey = '*'
+        if len(texset) > 0:
+            mat = self.dedup.get_material(rip, texset)
+            matkey = mat['ninjarip_datakey']
+
+        # Create or find object
+        objkey = '|'.join([mesh_key,matkey])
+
+        if self.filter_duplicates:
+            nobj = self.dedup.get_object(objkey, lambda: self.create_object(rip, obj_name, mesh, mat))
+        else:
+            nobj = self.create_object(rip, obj_name, mesh, mat)
+            nobj['ninjarip_datakey'] = objkey
+
+        # Select object
+        found = False
+
+        for o in scene.objects:
+            o.select = False
+            if o == nobj:
+                found = True
+
+        if not found:
+            scene.objects.link(nobj)
+            scene.update()
 
         nobj.select = True
         scene.objects.active = nobj
@@ -722,9 +878,21 @@ class RipImporter(bpy.types.Operator, ImportHelper, IORIPOrientationHelper):
         description="Skip meshes that don't use any textures (e.g. from zbuffer prefill pass)"
     )
 
+    detect_duplicates = BoolProperty(
+        default=False, name="Detect duplication",
+        description="Detect and share identical meshes and textures. Attaches materials to objects instead of mesh."
+    )
+    cross_duplicates = BoolProperty(
+        default=False, name="Cross-import tracking",
+        description="Track duplication across multiple imports. WARNING: does not detect edits to objects or changing import settings."
+    )
+    notex_duplicates = BoolProperty(
+        default=False, name="Ignore missing textures",
+        description="Missing texture files don't contribute to hashes for duplicate detection. Useful if you deleted dynamic textures like depth or shadow data."
+    )
     skip_duplicates = BoolProperty(
-        default=False, name="Skip duplicates",
-        description="Skip meshes that have exactly the same data, shaders and textures"
+        default=False, name="Skip full duplicates",
+        description="Skip meshes that have exactly the same data and textures"
     )
 
     override_attrs = BoolProperty(
@@ -787,7 +955,15 @@ class RipImporter(bpy.types.Operator, ImportHelper, IORIPOrientationHelper):
         misc = self.layout.box()
         misc.prop(self, "use_weights")
         misc.prop(self, "skip_untextured")
-        misc.prop(self, "skip_duplicates")
+        misc.prop(self, "detect_duplicates")
+
+        if self.detect_duplicates:
+            dup = misc.row()
+            dup.column().separator()
+            dup = dup.column()
+            dup.prop(self, "cross_duplicates")
+            dup.prop(self, "notex_duplicates")
+            dup.prop(self, "skip_duplicates")
 
         uv = self.layout.box()
         uv.prop(self, "uv_int")
@@ -831,7 +1007,8 @@ class RipImporter(bpy.types.Operator, ImportHelper, IORIPOrientationHelper):
             return (self.uv_mul[i], self.uv_add[i])
 
     def execute(self, context):
-        if len(self.files) == 0 or not os.path.isfile(os.path.join(self.directory,self.files[0].name)):
+        fnames = [f.name for f in self.files]
+        if len(fnames) == 0 or not os.path.isfile(os.path.join(self.directory,fnames[0])):
             self.report({'ERROR'}, 'No file is selected for import')
             return {'FINISHED'}
 
@@ -847,11 +1024,17 @@ class RipImporter(bpy.types.Operator, ImportHelper, IORIPOrientationHelper):
         conv.use_weights = self.use_weights
         conv.filter_unused_attrs = self.filter_unused_attrs
         conv.filter_unused_textures = self.filter_unused_textures
-        conv.filter_duplicates = self.skip_duplicates
         conv.normal_max_int = self.normal_int
         conv.normal_scale = list(map(self.get_normal_scale, range(3)))
         conv.uv_max_int = self.uv_int
         conv.uv_scale = list(map(self.get_uv_scale, range(2)))
+
+        if self.detect_duplicates:
+            conv.dedup = DuplicateTracker()
+            conv.dedup.hash_missing_textures = not self.notex_duplicates
+            if self.cross_duplicates:
+                conv.dedup.init_duplicate_tables()
+            conv.filter_duplicates = self.skip_duplicates
 
         if self.override_attrs:
             table = {}
@@ -863,14 +1046,14 @@ class RipImporter(bpy.types.Operator, ImportHelper, IORIPOrientationHelper):
 
         riplog = RipLogInfo() if self.use_shaders else None
 
-        for file in self.files:
-            rf = RipFile(os.path.join(self.directory, file.name), riplog)
+        for file in sorted(fnames):
+            rf = RipFile(os.path.join(self.directory, file), riplog)
             rf.parse_file()
             if self.use_shaders:
                 rf.parse_shaders()
             if self.skip_untextured and not rf.has_textures():
                 continue
-            conv.convert_object(rf, context.scene, file.name)
+            conv.convert_object(rf, context.scene, file)
 
         return {'FINISHED'}
 
